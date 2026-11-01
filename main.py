@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import os
+import re
 import sqlite3
-from datetime import datetime
+from datetime import date, datetime
 
 import anthropic
 from aiogram import Bot, Dispatcher, F
@@ -50,10 +51,11 @@ HELP = (
     "/expense 85 кава - записати витрату\n"
     "/income 30000 зарплата - записати надходження\n"
     "/report - звіт за поточний місяць\n"
+    "/report жовтень - звіт за інший місяць (або /report 2026-10)\n"
     "/undo - видалити свій останній запис\n"
     "/reset - видалити всі дані\n\n"
-    "Або просто пиши текстом: «купив каву за 85», «покажи підсумок», "
-    "«видали останній запис», «форматни дані»."
+    "Або просто пиши текстом: «вчора купив каву за 85», «покажи підсумок», "
+    "«звіт за жовтень», «видали останній запис», «форматни дані»."
 )
 
 KEYBOARD = ReplyKeyboardMarkup(
@@ -76,6 +78,12 @@ RESET_WORDS = (
     "видали дані", "стерти", "з нуля", "скинь дані",
 )
 
+WEEKDAYS = ["понеділок", "вівторок", "середа", "четвер", "пʼятниця", "субота", "неділя"]
+MONTH_NAMES = [
+    "січень", "лютий", "березень", "квітень", "травень", "червень",
+    "липень", "серпень", "вересень", "жовтень", "листопад", "грудень",
+]
+
 RECORD_TOOL = {
     "name": "save_transactions",
     "description": "Зберегти всі витрати та надходження з повідомлення користувача",
@@ -90,6 +98,13 @@ RECORD_TOOL = {
                         "kind": {"type": "string", "enum": ["expense", "income"]},
                         "amount": {"type": "number"},
                         "category": {"type": "string"},
+                        "date": {
+                            "type": "string",
+                            "description": "Дата запису у форматі YYYY-MM-DD. "
+                                           "Вказуй лише якщо користувач сам назвав "
+                                           "дату чи день («вчора», «15 жовтня»). "
+                                           "Інакше не заповнюй це поле.",
+                        },
                     },
                     "required": ["kind", "amount", "category"],
                 },
@@ -103,7 +118,17 @@ REPORT_TOOL = {
     "name": "show_report",
     "description": "Показати звіт, коли користувач просить підсумок, баланс, "
                    "статистику або питає, скільки витрачено чи залишилось",
-    "input_schema": {"type": "object", "properties": {}},
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "month": {
+                "type": "string",
+                "description": "Місяць звіту у форматі YYYY-MM. Вказуй лише якщо "
+                               "користувач назвав конкретний місяць («за жовтень», "
+                               "«минулий місяць»). Для поточного місяця не заповнюй.",
+            }
+        },
+    },
 }
 
 RESET_TOOL = {
@@ -121,42 +146,120 @@ UNDO_TOOL = {
 }
 
 
-def build_report() -> str:
-    month = datetime.now().strftime("%Y-%m")
+def valid_month(raw) -> str | None:
+    """Перевіряє місяць у форматі YYYY-MM: не з майбутнього, не раніше 2000 року."""
+    try:
+        d = datetime.strptime(str(raw), "%Y-%m")
+    except ValueError:
+        return None
+    month = d.strftime("%Y-%m")
+    if d.year < 2000 or month > date.today().strftime("%Y-%m"):
+        return None
+    return month
+
+
+def parse_month_text(text: str) -> str | None:
+    """Розбирає ручне введення: «жовтень», «жовтень 2025», «2026-10», «10.2026»."""
+    text = text.strip().lower()
+    if not text:
+        return None
+    month = valid_month(text)
+    if month:
+        return month
+    try:
+        return valid_month(datetime.strptime(text, "%m.%Y").strftime("%Y-%m"))
+    except ValueError:
+        pass
+    today = date.today()
+    year_match = re.search(r"\b(20\d\d)\b", text)
+    for i, name in enumerate(MONTH_NAMES, start=1):
+        if text.startswith(name[:3]):
+            if year_match:
+                year = int(year_match.group(1))
+            else:
+                year = today.year if i <= today.month else today.year - 1
+            return valid_month(f"{year}-{i:02d}")
+    return None
+
+
+def month_title(month: str) -> str:
+    year, num = month.split("-")
+    return f"{MONTH_NAMES[int(num) - 1]} {year}"
+
+
+def available_months() -> list[str]:
+    rows = db.execute(
+        "SELECT DISTINCT substr(created_at, 1, 7) FROM transactions ORDER BY 1 DESC"
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def build_report(month: str | None = None) -> str:
+    month = month or date.today().strftime("%Y-%m")
     rows = db.execute(
         "SELECT kind, category, SUM(amount) FROM transactions "
         "WHERE created_at LIKE ? GROUP BY kind, category ORDER BY SUM(amount) DESC",
         (month + "%",),
     ).fetchall()
     if not rows:
-        return "За цей місяць записів ще немає."
+        text = f"Записів за {month_title(month)} немає."
+        months = available_months()
+        if months:
+            text += "\nДані є за: " + ", ".join(month_title(m) for m in months[:6])
+        return text
     total_in = sum(r[2] for r in rows if r[0] == "income")
     total_out = sum(r[2] for r in rows if r[0] == "expense")
-    lines = [f"📊 Звіт за {month}", f"Надходження: {total_in:.2f}",
+    lines = [f"📊 Звіт: {month_title(month)}", f"Надходження: {total_in:.2f}",
              f"Витрати: {total_out:.2f}", f"Залишок: {total_in - total_out:.2f}", "",
              "Витрати за категоріями:"]
     lines += [f"- {cat}: {s:.2f}" for kind, cat, s in rows if kind == "expense"]
     return "\n".join(lines)
 
 
+def resolve_date(raw) -> tuple[date, bool]:
+    """Перевіряє дату від ШІ. Повертає (дата, чи_була_проблема)."""
+    today = date.today()
+    if not raw:
+        return today, False
+    try:
+        d = datetime.strptime(str(raw), "%Y-%m-%d").date()
+    except ValueError:
+        return today, True
+    if d > today or (today - d).days > 366:
+        return today, True
+    return d, False
+
+
+def build_system_prompt() -> str:
+    today = date.today()
+    return (
+        f"Сьогодні {today.isoformat()} ({WEEKDAYS[today.weekday()]}). "
+        "Ти асистент сімейного бюджету, користувачі пишуть українською. "
+        "Якщо повідомлення містить суми витрат чи надходжень, викликай "
+        "save_transactions і не вигадуй сум, яких немає в тексті. Категорію "
+        "пиши одним-двома словами з малої літери. Якщо користувач вказує, коли "
+        "це було («вчора», «позавчора», «у п'ятницю», «15 жовтня»), обчисли "
+        "дату у форматі YYYY-MM-DD і запиши в поле date. Якщо рік не вказано, "
+        "бери поточний. Якщо дату не згадано, не заповнюй поле date. "
+        "Якщо користувач просить звіт, підсумок, баланс або питає про свої "
+        "витрати, викликай show_report. Якщо він назвав конкретний місяць "
+        "(«звіт за жовтень», «що було минулого місяця»), обчисли його у форматі "
+        "YYYY-MM і запиши в поле month; якщо такий місяць цього року ще не "
+        "настав, бери минулий рік. Для поточного місяця поле month не заповнюй. "
+        "Якщо користувач хоче видалити, очистити, обнулити чи відформатувати "
+        "ВСІ дані (наприклад: «форматни дані», «очисти все», «почнемо з нуля»), "
+        "викликай reset_data. Якщо користувач хоче видалити чи скасувати лише "
+        "останній запис (наприклад: «видали останній запис», «скасуй останню "
+        "витрату», «я помилився»), викликай undo_last. Якщо немає нічого з "
+        "цього, викликай save_transactions з порожнім списком."
+    )
+
+
 async def interpret(text: str) -> tuple[str, dict]:
     response = await client.messages.create(
         model="claude-haiku-5-5",
         max_tokens=500,
-        system=(
-            "Ти асистент сімейного бюджету, користувачі пишуть українською. "
-            "Якщо повідомлення містить суми витрат чи надходжень, викликай "
-            "save_transactions і не вигадуй сум, яких немає в тексті. Категорію "
-            "пиши одним-двома словами з малої літери. Якщо користувач просить "
-            "звіт, підсумок, баланс або питає про свої витрати, викликай "
-            "show_report. Якщо користувач хоче видалити, очистити, обнулити чи "
-            "відформатувати ВСІ дані (наприклад: «форматни дані», «очисти все», "
-            "«почнемо з нуля»), викликай reset_data. Якщо користувач хоче "
-            "видалити чи скасувати лише останній запис (наприклад: «видали "
-            "останній запис», «скасуй останню витрату», «я помилився»), викликай "
-            "undo_last. Якщо немає нічого з цього, викликай save_transactions "
-            "з порожнім списком."
-        ),
+        system=build_system_prompt(),
         tools=[RECORD_TOOL, REPORT_TOOL, RESET_TOOL, UNDO_TOOL],
         tool_choice={"type": "any"},
         messages=[{"role": "user", "content": text}],
@@ -238,8 +341,16 @@ async def income(message: Message, command: CommandObject):
 
 
 @dp.message(Command("report"))
-async def report(message: Message):
-    await message.answer(build_report())
+async def report(message: Message, command: CommandObject):
+    month = None
+    if command.args:
+        month = parse_month_text(command.args)
+        if not month:
+            await message.answer(
+                "Не зрозумів місяць. Приклади: /report жовтень, /report 2026-10"
+            )
+            return
+    await message.answer(build_report(month))
 
 
 @dp.message(F.text == "📊 Звіт")
@@ -296,7 +407,12 @@ async def free_text(message: Message):
         return
 
     if action == "show_report":
-        await message.answer(build_report())
+        raw_month = data.get("month")
+        month = valid_month(raw_month) if raw_month else None
+        note = ""
+        if raw_month and not month:
+            note = "⚠️ Місяць не вдалося визначити, показую поточний.\n\n"
+        await message.answer(note + build_report(month))
         return
     if action == "undo_last":
         await undo_last(message)
@@ -314,18 +430,26 @@ async def free_text(message: Message):
         await message.answer("Не знайшов у повідомленні сум. Спробуй ще раз.")
         return
 
-    now = datetime.now().isoformat(timespec="seconds")
     lines = []
+    date_problem = False
     for r in valid:
+        d, bad = resolve_date(r.get("date"))
+        date_problem = date_problem or bad
+        created_at = f"{d.isoformat()}T{datetime.now():%H:%M:%S}"
         db.execute(
             "INSERT INTO transactions (user_id, created_at, kind, amount, category) "
             "VALUES (?, ?, ?, ?, ?)",
-            (message.from_user.id, now, r["kind"], r["amount"], r["category"]),
+            (message.from_user.id, created_at, r["kind"], r["amount"], r["category"]),
         )
         sign = "➖" if r["kind"] == "expense" else "➕"
-        lines.append(f"{sign} {r['amount']:.2f} ({r['category']})")
+        suffix = "" if d == date.today() else f" — {d:%d.%m.%Y}"
+        lines.append(f"{sign} {r['amount']:.2f} ({r['category']}){suffix}")
     db.commit()
-    await message.answer("Записав:\n" + "\n".join(lines))
+
+    answer = "Записав:\n" + "\n".join(lines)
+    if date_problem:
+        answer += "\n\n⚠️ Дату не вдалося визначити, записано сьогоднішньою."
+    await message.answer(answer)
 
 
 async def main():
