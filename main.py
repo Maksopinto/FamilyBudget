@@ -1,14 +1,23 @@
-import logging
-import anthropic
 import asyncio
+import logging
 import os
 import sqlite3
 from datetime import datetime
 
+import anthropic
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
 from dotenv import load_dotenv
+
+logging.basicConfig(level=logging.INFO)
 
 load_dotenv()
 client = anthropic.AsyncAnthropic()
@@ -32,15 +41,30 @@ CREATE TABLE IF NOT EXISTS transactions (
 db.commit()
 
 dp = Dispatcher()
-# Бот відповідає лише дозволеним користувачам
+# Бот відповідає лише дозволеним користувачам (і на повідомлення, і на кнопки)
 dp.message.filter(F.from_user.id.in_(ALLOWED))
+dp.callback_query.filter(F.from_user.id.in_(ALLOWED))
 
 HELP = (
     "Команди:\n"
     "/expense 85 кава - записати витрату\n"
     "/income 30000 зарплата - записати надходження\n"
-    "/report - звіт за поточний місяць"
+    "/report - звіт за поточний місяць\n"
+    "/reset - видалити всі дані\n\n"
+    "Або просто пиши текстом: «купив каву за 85», «покажи підсумок», "
+    "«форматни дані»."
 )
+
+KEYBOARD = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="📊 Звіт")]],
+    resize_keyboard=True,
+)
+
+CONFIRM_KB = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="🗑 Так, видалити все", callback_data="reset_yes"),
+    InlineKeyboardButton(text="Скасувати", callback_data="reset_no"),
+]])
+
 RECORD_TOOL = {
     "name": "save_transactions",
     "description": "Зберегти всі витрати та надходження з повідомлення користувача",
@@ -64,29 +88,64 @@ RECORD_TOOL = {
     },
 }
 
+REPORT_TOOL = {
+    "name": "show_report",
+    "description": "Показати звіт, коли користувач просить підсумок, баланс, "
+                   "статистику або питає, скільки витрачено чи залишилось",
+    "input_schema": {"type": "object", "properties": {}},
+}
 
-async def parse_transactions(text: str) -> list[dict]:
+RESET_TOOL = {
+    "name": "reset_data",
+    "description": "Користувач хоче видалити, очистити, обнулити або відформатувати "
+                   "всі дані і почати облік з нуля",
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+
+def build_report() -> str:
+    month = datetime.now().strftime("%Y-%m")
+    rows = db.execute(
+        "SELECT kind, category, SUM(amount) FROM transactions "
+        "WHERE created_at LIKE ? GROUP BY kind, category ORDER BY SUM(amount) DESC",
+        (month + "%",),
+    ).fetchall()
+    if not rows:
+        return "За цей місяць записів ще немає."
+    total_in = sum(r[2] for r in rows if r[0] == "income")
+    total_out = sum(r[2] for r in rows if r[0] == "expense")
+    lines = [f"📊 Звіт за {month}", f"Надходження: {total_in:.2f}",
+             f"Витрати: {total_out:.2f}", f"Залишок: {total_in - total_out:.2f}", "",
+             "Витрати за категоріями:"]
+    lines += [f"- {cat}: {s:.2f}" for kind, cat, s in rows if kind == "expense"]
+    return "\n".join(lines)
+
+
+async def interpret(text: str) -> tuple[str, dict]:
     response = await client.messages.create(
         model="claude-haiku-5-5",
         max_tokens=500,
         system=(
-            "Ти витягуєш фінансові записи з повідомлень українською. "
-            "Не вигадуй суми, яких немає в тексті. Категорію пиши одним-двома "
-            "словами з малої літери. Якщо записів немає, поверни порожній список."
+            "Ти асистент сімейного бюджету, користувачі пишуть українською. "
+            "Якщо повідомлення містить суми витрат чи надходжень, викликай "
+            "save_transactions і не вигадуй сум, яких немає в тексті. Категорію "
+            "пиши одним-двома словами з малої літери. Якщо користувач просить "
+            "звіт, підсумок, баланс або питає про свої витрати, викликай "
+            "show_report. Якщо користувач хоче видалити, очистити, обнулити чи "
+            "відформатувати всі дані або почати з нуля, викликай reset_data. "
+            "Якщо немає нічого з цього, викликай save_transactions з порожнім "
+            "списком."
         ),
-        tools=[RECORD_TOOL],
-        tool_choice={"type": "tool", "name": "save_transactions"},
+        tools=[RECORD_TOOL, REPORT_TOOL, RESET_TOOL],
+        tool_choice={"type": "any"},
         messages=[{"role": "user", "content": text}],
     )
+    logging.info("Токени: вхід=%s, вихід=%s",
+                 response.usage.input_tokens, response.usage.output_tokens)
     for block in response.content:
         if block.type == "tool_use":
-            return block.input.get("transactions", [])
-    return []
-
-
-@dp.message(Command("start", "help"))
-async def start(message: Message):
-    await message.answer(HELP)
+            return block.name, block.input
+    return "save_transactions", {"transactions": []}
 
 
 async def add_record(message: Message, command: CommandObject, kind: str):
@@ -114,6 +173,23 @@ async def add_record(message: Message, command: CommandObject, kind: str):
     await message.answer(f"✅ {label}: {amount:.2f} ({category})")
 
 
+async def ask_reset(message: Message):
+    count = db.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
+    if count == 0:
+        await message.answer("Даних і так немає, видаляти нічого.")
+        return
+    await message.answer(
+        f"⚠️ Видалити всі записи ({count})? Це незворотно. "
+        "Перед видаленням я збережу резервну копію.",
+        reply_markup=CONFIRM_KB,
+    )
+
+
+@dp.message(Command("start", "help"))
+async def start(message: Message):
+    await message.answer(HELP, reply_markup=KEYBOARD)
+
+
 @dp.message(Command("expense"))
 async def expense(message: Message, command: CommandObject):
     await add_record(message, command, "expense")
@@ -126,32 +202,56 @@ async def income(message: Message, command: CommandObject):
 
 @dp.message(Command("report"))
 async def report(message: Message):
-    month = datetime.now().strftime("%Y-%m")
-    rows = db.execute(
-        "SELECT kind, category, SUM(amount) FROM transactions "
-        "WHERE created_at LIKE ? GROUP BY kind, category ORDER BY SUM(amount) DESC",
-        (month + "%",),
-    ).fetchall()
-    if not rows:
-        await message.answer("За цей місяць записів ще немає.")
-        return
-    total_in = sum(r[2] for r in rows if r[0] == "income")
-    total_out = sum(r[2] for r in rows if r[0] == "expense")
-    lines = [f"📊 Звіт за {month}", f"Надходження: {total_in:.2f}",
-             f"Витрати: {total_out:.2f}", f"Залишок: {total_in - total_out:.2f}", "",
-             "Витрати за категоріями:"]
-    lines += [f"- {cat}: {s:.2f}" for kind, cat, s in rows if kind == "expense"]
-    await message.answer("\n".join(lines))
+    await message.answer(build_report())
+
+
+@dp.message(F.text == "📊 Звіт")
+async def report_button(message: Message):
+    await message.answer(build_report())
+
+
+@dp.message(Command("reset"))
+async def reset_command(message: Message):
+    await ask_reset(message)
+
+
+@dp.callback_query(F.data == "reset_yes")
+async def reset_yes(callback: CallbackQuery):
+    backup = f"budget_backup_{datetime.now():%Y%m%d_%H%M%S}.db"
+    dst = sqlite3.connect(backup)
+    db.backup(dst)
+    dst.close()
+    db.execute("DELETE FROM transactions")
+    db.execute("DELETE FROM sqlite_sequence WHERE name = 'transactions'")
+    db.commit()
+    await callback.message.edit_text(f"✅ Усі дані видалено. Резервна копія: {backup}")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "reset_no")
+async def reset_no(callback: CallbackQuery):
+    await callback.message.edit_text("Скасовано, дані збережено.")
+    await callback.answer()
+
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def free_text(message: Message):
     try:
-        records = await parse_transactions(message.text)
+        action, data = await interpret(message.text)
     except Exception:
         logging.exception("Помилка звернення до ШІ")
         await message.answer("Не вдалося звернутися до ШІ. Спробуй пізніше або використай /expense.")
         return
 
+    if action == "show_report":
+        await message.answer(build_report())
+        return
+
+    if action == "reset_data":
+        await ask_reset(message)
+        return
+
+    records = data.get("transactions", [])
     valid = [
         r for r in records
         if r.get("kind") in ("expense", "income") and r.get("amount", 0) > 0
@@ -172,7 +272,8 @@ async def free_text(message: Message):
         lines.append(f"{sign} {r['amount']:.2f} ({r['category']})")
     db.commit()
     await message.answer("Записав:\n" + "\n".join(lines))
-    
+
+
 async def main():
     bot = Bot(token=TOKEN)
     await dp.start_polling(bot)
