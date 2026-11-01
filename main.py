@@ -50,9 +50,10 @@ HELP = (
     "/expense 85 кава - записати витрату\n"
     "/income 30000 зарплата - записати надходження\n"
     "/report - звіт за поточний місяць\n"
+    "/undo - видалити свій останній запис\n"
     "/reset - видалити всі дані\n\n"
     "Або просто пиши текстом: «купив каву за 85», «покажи підсумок», "
-    "«форматни дані»."
+    "«видали останній запис», «форматни дані»."
 )
 
 KEYBOARD = ReplyKeyboardMarkup(
@@ -64,6 +65,16 @@ CONFIRM_KB = InlineKeyboardMarkup(inline_keyboard=[[
     InlineKeyboardButton(text="🗑 Так, видалити все", callback_data="reset_yes"),
     InlineKeyboardButton(text="Скасувати", callback_data="reset_no"),
 ]])
+
+# Фрази, за якими бот розуміє намір без звернення до ШІ
+UNDO_WORDS = (
+    "останній запис", "останню витрат", "останнє надходж", "видали останн",
+    "скасуй останн", "відміни останн", "прибери останн", "undo",
+)
+RESET_WORDS = (
+    "форматн", "очист", "обнул", "видали все", "видалити все",
+    "видали дані", "стерти", "з нуля", "скинь дані",
+)
 
 RECORD_TOOL = {
     "name": "save_transactions",
@@ -98,7 +109,14 @@ REPORT_TOOL = {
 RESET_TOOL = {
     "name": "reset_data",
     "description": "Користувач хоче видалити, очистити, обнулити або відформатувати "
-                   "всі дані і почати облік з нуля",
+                   "ВСІ дані і почати облік з нуля",
+    "input_schema": {"type": "object", "properties": {}},
+}
+
+UNDO_TOOL = {
+    "name": "undo_last",
+    "description": "Користувач хоче видалити, скасувати або відмінити лише "
+                   "ОСТАННІЙ запис (одну останню витрату чи надходження)",
     "input_schema": {"type": "object", "properties": {}},
 }
 
@@ -132,11 +150,14 @@ async def interpret(text: str) -> tuple[str, dict]:
             "пиши одним-двома словами з малої літери. Якщо користувач просить "
             "звіт, підсумок, баланс або питає про свої витрати, викликай "
             "show_report. Якщо користувач хоче видалити, очистити, обнулити чи "
-            "відформатувати всі дані або почати з нуля, викликай reset_data. "
-            "Якщо немає нічого з цього, викликай save_transactions з порожнім "
-            "списком."
+            "відформатувати ВСІ дані (наприклад: «форматни дані», «очисти все», "
+            "«почнемо з нуля»), викликай reset_data. Якщо користувач хоче "
+            "видалити чи скасувати лише останній запис (наприклад: «видали "
+            "останній запис», «скасуй останню витрату», «я помилився»), викликай "
+            "undo_last. Якщо немає нічого з цього, викликай save_transactions "
+            "з порожнім списком."
         ),
-        tools=[RECORD_TOOL, REPORT_TOOL, RESET_TOOL],
+        tools=[RECORD_TOOL, REPORT_TOOL, RESET_TOOL, UNDO_TOOL],
         tool_choice={"type": "any"},
         messages=[{"role": "user", "content": text}],
     )
@@ -171,6 +192,22 @@ async def add_record(message: Message, command: CommandObject, kind: str):
     db.commit()
     label = "Витрата" if kind == "expense" else "Надходження"
     await message.answer(f"✅ {label}: {amount:.2f} ({category})")
+
+
+async def undo_last(message: Message):
+    row = db.execute(
+        "SELECT id, kind, amount, category FROM transactions "
+        "WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+        (message.from_user.id,),
+    ).fetchone()
+    if row is None:
+        await message.answer("У тебе ще немає записів, видаляти нічого.")
+        return
+    record_id, kind, amount, category = row
+    db.execute("DELETE FROM transactions WHERE id = ?", (record_id,))
+    db.commit()
+    sign = "➖" if kind == "expense" else "➕"
+    await message.answer(f"↩️ Видалено останній запис: {sign} {amount:.2f} ({category})")
 
 
 async def ask_reset(message: Message):
@@ -210,6 +247,11 @@ async def report_button(message: Message):
     await message.answer(build_report())
 
 
+@dp.message(Command("undo"))
+async def undo_command(message: Message):
+    await undo_last(message)
+
+
 @dp.message(Command("reset"))
 async def reset_command(message: Message):
     await ask_reset(message)
@@ -236,6 +278,16 @@ async def reset_no(callback: CallbackQuery):
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def free_text(message: Message):
+    text_lower = message.text.lower()
+
+    # Спочатку специфічна фраза про останній запис, потім про повне очищення
+    if any(w in text_lower for w in UNDO_WORDS):
+        await undo_last(message)
+        return
+    if any(w in text_lower for w in RESET_WORDS):
+        await ask_reset(message)
+        return
+
     try:
         action, data = await interpret(message.text)
     except Exception:
@@ -246,7 +298,9 @@ async def free_text(message: Message):
     if action == "show_report":
         await message.answer(build_report())
         return
-
+    if action == "undo_last":
+        await undo_last(message)
+        return
     if action == "reset_data":
         await ask_reset(message)
         return
