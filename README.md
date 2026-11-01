@@ -75,8 +75,8 @@ To interpret a message, its text and the list of existing category names are sen
 Requirements: Python 3.11+ (tested on 3.13; on very new Python releases some dependencies may not have prebuilt wheels yet).
 
 ```bash
-git clone https://github.com/<your-username>/<your-repo>.git
-cd <your-repo>
+git clone https://github.com/Maksopinto/FamilyBudget.git 
+cd FamilyBudget
 python -m venv venv
 # Windows PowerShell: venv\Scripts\Activate.ps1
 # macOS/Linux:        source venv/bin/activate
@@ -110,6 +110,27 @@ python main.py
 | `/undo` | Delete your last record |
 | `/reset` | Delete all data (with confirmation and backup) |
 
+### Screenshots
+
+**Natural-language entry.** The bot splits one message into several records with amounts and categories.
+
+![Natural-language entry](docs/add.jpg)
+
+**Questions about categories.** Totals are computed in code, not by the model. If a category is not found, the bot lists the existing ones.
+
+![Category questions](docs/queries.jpg)
+
+**Month comparison.** Income, expenses and balance per month, plus the change between them.
+
+![Month comparison](docs/compare.jpg)
+
+**Safe reset.** Wiping data needs an explicit confirmation button.
+
+![Reset confirmation](docs/reset.jpg)
+
+**Automatic backup.** The database is backed up before anything is deleted.
+
+![Reset done with backup](docs/reset-done.jpg)
 Or just write naturally: "yesterday coffee 85", "report for October", "compare October and November", "how much on taxi in October?", "delete the last record", "wipe the data".
 
 ## Tech stack
