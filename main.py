@@ -54,8 +54,12 @@ HELP = (
     "/report жовтень - звіт за інший місяць (або /report 2026-10)\n"
     "/undo - видалити свій останній запис\n"
     "/reset - видалити всі дані\n\n"
-    "Або просто пиши текстом: «вчора купив каву за 85», «покажи підсумок», "
-    "«звіт за жовтень», «видали останній запис», «форматни дані»."
+    "Або просто пиши текстом:\n"
+    "«вчора купив каву за 85»\n"
+    "«звіт за жовтень»\n"
+    "«порівняй жовтень і листопад»\n"
+    "«скільки пішло на каву в жовтні?»\n"
+    "«видали останній запис», «форматни дані»"
 )
 
 KEYBOARD = ReplyKeyboardMarkup(
@@ -83,6 +87,7 @@ MONTH_NAMES = [
     "січень", "лютий", "березень", "квітень", "травень", "червень",
     "липень", "серпень", "вересень", "жовтень", "листопад", "грудень",
 ]
+MAX_MONTHS = 12
 
 RECORD_TOOL = {
     "name": "save_transactions",
@@ -116,8 +121,8 @@ RECORD_TOOL = {
 
 REPORT_TOOL = {
     "name": "show_report",
-    "description": "Показати звіт, коли користувач просить підсумок, баланс, "
-                   "статистику або питає, скільки витрачено чи залишилось",
+    "description": "Показати повний звіт за ОДИН місяць (без порівняння і без "
+                   "конкретної категорії): підсумок, баланс, статистика",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -127,6 +132,38 @@ REPORT_TOOL = {
                                "користувач назвав конкретний місяць («за жовтень», "
                                "«минулий місяць»). Для поточного місяця не заповнюй.",
             }
+        },
+    },
+}
+
+ANALYZE_TOOL = {
+    "name": "analyze_spending",
+    "description": "Порівняти витрати й надходження за кілька місяців, АБО "
+                   "дізнатися, скільки грошей пішло чи надійшло на конкретну "
+                   "категорію за один чи кілька місяців",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "months": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Усі потрібні місяці у форматі YYYY-MM. Для "
+                               "порівняння перелічи кожен місяць. Якщо місяць не "
+                               "названо, залиш порожнім (буде поточний).",
+            },
+            "category": {
+                "type": "string",
+                "description": "Категорія, якщо питають про конкретну статтю "
+                               "(кава, таксі). Бери назву, найближчу до наявних "
+                               "категорій. Без категорії поле не заповнюй.",
+            },
+            "kind": {
+                "type": "string",
+                "enum": ["expense", "income"],
+                "description": "expense, якщо питають про витрати («скільки пішло», "
+                               "«скільки витратили»); income, якщо про надходження "
+                               "(«скільки отримали»). Якщо незрозуміло, не заповнюй.",
+            },
         },
     },
 }
@@ -194,6 +231,15 @@ def available_months() -> list[str]:
     return [r[0] for r in rows]
 
 
+def known_categories(limit: int = 40) -> list[str]:
+    rows = db.execute(
+        "SELECT category, COUNT(*) AS n FROM transactions "
+        "GROUP BY category ORDER BY n DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [r[0].strip()[:40] for r in rows if r[0].strip()]
+
+
 def build_report(month: str | None = None) -> str:
     month = month or date.today().strftime("%Y-%m")
     rows = db.execute(
@@ -216,6 +262,73 @@ def build_report(month: str | None = None) -> str:
     return "\n".join(lines)
 
 
+def build_analysis(months: list[str], category: str | None, kind: str | None) -> str:
+    """Порівняння місяців або підсумок за категорією. Усі суми рахує код."""
+    months = months or [date.today().strftime("%Y-%m")]
+    placeholders = ",".join("?" * len(months))  # лише знаки питання, значення - параметрами
+    rows = db.execute(
+        "SELECT substr(created_at, 1, 7), kind, category, amount FROM transactions "
+        f"WHERE substr(created_at, 1, 7) IN ({placeholders})",
+        months,
+    ).fetchall()
+
+    cat = category.strip().lower() if category else None
+    stats = {m: {"expense": 0.0, "income": 0.0} for m in months}
+    for month, k, c, amount in rows:
+        if cat and cat not in c.lower():
+            continue
+        stats[month][k] += amount
+
+    # --- Запит про конкретну категорію ---
+    if cat:
+        kinds = [kind] if kind else ["expense", "income"]
+        if all(stats[m][k] == 0 for m in months for k in kinds):
+            text = f"За запитом «{category}» записів у вказаних місяцях не знайшов."
+            cats = known_categories(15)
+            if cats:
+                text += "\nНаявні категорії: " + ", ".join(cats)
+            return text
+        lines = [f"🔎 «{category}»"]
+        for m in months:
+            parts = []
+            for k in kinds:
+                if stats[m][k] or kind:
+                    label = "витрати" if k == "expense" else "надходження"
+                    parts.append(f"{label} {stats[m][k]:.2f}")
+            lines.append(f"{month_title(m)}: " + (", ".join(parts) if parts else "0.00"))
+        if len(months) > 1:
+            totals = []
+            for k in kinds:
+                total = sum(stats[m][k] for m in months)
+                if total or kind:
+                    label = "витрати" if k == "expense" else "надходження"
+                    totals.append(f"{label} {total:.2f}")
+            lines.append("Разом: " + ", ".join(totals))
+        return "\n".join(lines)
+
+    # --- Загальне порівняння місяців ---
+    title = "📈 Порівняння місяців" if len(months) > 1 else f"📊 {month_title(months[0])}"
+    lines = [title]
+    for m in months:
+        inc, exp = stats[m]["income"], stats[m]["expense"]
+        lines.append(
+            f"{month_title(m)}: надходження {inc:.2f}, витрати {exp:.2f}, "
+            f"залишок {inc - exp:.2f}"
+        )
+    if len(months) > 1:
+        first, last = months[0], months[-1]
+        lines.append("")
+        for label, k in (("Витрати", "expense"), ("Надходження", "income")):
+            a, b = stats[first][k], stats[last][k]
+            diff = b - a
+            pct = f" ({diff / a * 100:+.0f}%)" if a else ""
+            lines.append(
+                f"{label}: {diff:+.2f}{pct} "
+                f"({month_title(first)} → {month_title(last)})"
+            )
+    return "\n".join(lines)
+
+
 def resolve_date(raw) -> tuple[date, bool]:
     """Перевіряє дату від ШІ. Повертає (дата, чи_була_проблема)."""
     today = date.today()
@@ -232,20 +345,30 @@ def resolve_date(raw) -> tuple[date, bool]:
 
 def build_system_prompt() -> str:
     today = date.today()
+    cats = known_categories()
+    cats_text = ("Наявні категорії в обліку: " + ", ".join(cats) + ". ") if cats else ""
     return (
         f"Сьогодні {today.isoformat()} ({WEEKDAYS[today.weekday()]}). "
         "Ти асистент сімейного бюджету, користувачі пишуть українською. "
+        + cats_text +
         "Якщо повідомлення містить суми витрат чи надходжень, викликай "
         "save_transactions і не вигадуй сум, яких немає в тексті. Категорію "
-        "пиши одним-двома словами з малої літери. Якщо користувач вказує, коли "
+        "пиши одним-двома словами з малої літери у називному відмінку, за "
+        "можливості використовуй наявні категорії. Якщо користувач вказує, коли "
         "це було («вчора», «позавчора», «у п'ятницю», «15 жовтня»), обчисли "
         "дату у форматі YYYY-MM-DD і запиши в поле date. Якщо рік не вказано, "
         "бери поточний. Якщо дату не згадано, не заповнюй поле date. "
-        "Якщо користувач просить звіт, підсумок, баланс або питає про свої "
-        "витрати, викликай show_report. Якщо він назвав конкретний місяць "
-        "(«звіт за жовтень», «що було минулого місяця»), обчисли його у форматі "
-        "YYYY-MM і запиши в поле month; якщо такий місяць цього року ще не "
-        "настав, бери минулий рік. Для поточного місяця поле month не заповнюй. "
+        "Якщо користувач просить звіт чи підсумок за ОДИН місяць без категорії, "
+        "викликай show_report; якщо назвав конкретний місяць, обчисли його у "
+        "форматі YYYY-MM і запиши в поле month, для поточного місяця поле не "
+        "заповнюй. Якщо користувач хоче порівняти місяці або питає, скільки "
+        "грошей пішло чи надійшло на конкретну категорію (за один чи кілька "
+        "місяців), викликай analyze_spending: у months перелічи всі потрібні "
+        "місяці у форматі YYYY-MM (для «цей місяць» і «минулий місяць» обчисли "
+        "від сьогоднішньої дати; «останні 3 місяці» - три місяці, включно з "
+        "поточним), у category - назву категорії, найближчу до наявних, у kind "
+        "- expense для витрат чи income для надходжень. Якщо такий місяць цього "
+        "року ще не настав, бери минулий рік. "
         "Якщо користувач хоче видалити, очистити, обнулити чи відформатувати "
         "ВСІ дані (наприклад: «форматни дані», «очисти все», «почнемо з нуля»), "
         "викликай reset_data. Якщо користувач хоче видалити чи скасувати лише "
@@ -260,7 +383,7 @@ async def interpret(text: str) -> tuple[str, dict]:
         model="claude-haiku-5-5",
         max_tokens=500,
         system=build_system_prompt(),
-        tools=[RECORD_TOOL, REPORT_TOOL, RESET_TOOL, UNDO_TOOL],
+        tools=[RECORD_TOOL, REPORT_TOOL, ANALYZE_TOOL, RESET_TOOL, UNDO_TOOL],
         tool_choice={"type": "any"},
         messages=[{"role": "user", "content": text}],
     )
@@ -414,6 +537,20 @@ async def free_text(message: Message):
             note = "⚠️ Місяць не вдалося визначити, показую поточний.\n\n"
         await message.answer(note + build_report(month))
         return
+
+    if action == "analyze_spending":
+        raw_months = data.get("months") or []
+        months = sorted({m for m in (valid_month(x) for x in raw_months[:MAX_MONTHS]) if m})
+        note = ""
+        if raw_months and not months:
+            note = "⚠️ Місяці не вдалося визначити, показую поточний.\n\n"
+        category = data.get("category")
+        if not isinstance(category, str) or not category.strip():
+            category = None
+        kind = data.get("kind") if data.get("kind") in ("expense", "income") else None
+        await message.answer(note + build_analysis(months, category, kind))
+        return
+
     if action == "undo_last":
         await undo_last(message)
         return
